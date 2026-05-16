@@ -55,6 +55,7 @@ def call_ollama(messages: list[Message], model: str | None = None) -> str:
     payload = {
         "model": model or OLLAMA_MODEL,
         "messages": messages,
+        "format": "json",
         "stream": False,
         "options": {
             "temperature": 0,

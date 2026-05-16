@@ -25,6 +25,13 @@ call_llm(messages, provider)
 
 ## Setup
 
+This project was built with Python 3.14.4 via pyenv:
+
+```bash
+pyenv local 3.14.4
+python3 -m pip install -r requirements.txt
+```
+
 Copy the example environment file:
 
 ```bash
@@ -104,7 +111,191 @@ The `read_page` tool returns:
 ```python
 {
     "url": "...",
+    "domain": "...",
     "title": "...",
-    "text": "..."
+    "text": "...",
+    "char_count": 6000,
+    "source_char_count": 18420,
+    "was_truncated": true
 }
 ```
+
+## Layer 3: Action Format
+
+Ask the model to choose one next research action without running the tool yet:
+
+```bash
+python3 main.py agent-step "What are the tradeoffs between RAG and long-context LLMs?"
+```
+
+The model must return:
+
+```python
+{
+    "thought": "...",
+    "action": "search_web | read_page | finish",
+    "action_input": {
+        "query | url | reason": "..."
+    }
+}
+```
+
+## Layer 4: Orchestrator
+
+Run the simple research agent loop:
+
+```bash
+python3 main.py run "What are the tradeoffs between RAG and long-context LLMs?" --provider ollama --max-steps 5 --min-sources 2 --min-source-chars 500
+```
+
+Save the final answer as Markdown:
+
+```bash
+python3 main.py run "What are the tradeoffs between RAG and long-context LLMs?" --provider ollama --max-steps 5 --min-sources 2 --min-source-chars 500 --output outputs/rag_vs_long_context.md
+```
+
+When `--output` is provided, the CLI also saves a structured trace beside the report:
+
+```text
+outputs/rag_vs_long_context.md.trace.json
+```
+
+The orchestrator repeats:
+
+```text
+plan targeted searches before the action loop
+ask model for next action
+run the selected tool
+extract evidence notes after successful page reads
+score source quality after successful page reads
+add the observation to history
+ask again
+synthesize the final answer after finish is accepted
+reflect on grounding and completeness
+revise once if reflection says the current evidence can fix the answer
+save Markdown report and JSON trace when --output is provided
+```
+
+It stops when the model chooses `finish` or when `max_steps` is reached.
+
+The command prints progress as each step runs, then prints the full JSON result at the end.
+
+The orchestrator enforces `--min-sources` and `--min-source-chars` in code, so a model cannot finish until enough substantial pages were successfully read. The page reader returns source metadata such as domain, extracted character counts, and truncation status so later layers can reason about source quality without guessing from the text blob alone.
+
+## Layer 5: Evidence Notes
+
+After every successful `read_page` action, the orchestrator asks the model to extract compact evidence notes from that page:
+
+```python
+{
+    "relevance": "high | medium | low",
+    "summary": "...",
+    "notes": [
+        {
+            "claim": "...",
+            "supporting_text": "..."
+        }
+    ]
+}
+```
+
+This is an internal post-processing step, not a new agent action. The action loop stays simple, while each page observation becomes more useful for the final synthesis.
+
+## Layer 6: Answer Synthesis
+
+The `finish` action is now only a control signal:
+
+```python
+{
+    "thought": "the evidence is sufficient",
+    "action": "finish",
+    "action_input": {
+        "reason": "..."
+    }
+}
+```
+
+After Python accepts the finish action, it calls a separate answer synthesis prompt that uses the extracted evidence notes and source list. The synthesizer returns:
+
+```python
+{
+    "answer": "...",
+    "confidence": "high | medium | low",
+    "limitations": "..."
+}
+```
+
+This separates deciding when to stop from writing the final answer.
+
+## Layer 7: Source Quality
+
+After evidence extraction, the orchestrator scores the source itself:
+
+```python
+{
+    "source_type": "primary | academic | government | news | company | blog | reference | unknown",
+    "credibility": "high | medium | low",
+    "relevance": "high | medium | low",
+    "weight": 1,
+    "reason": "..."
+}
+```
+
+The final synthesizer sees these scores and is instructed to give more weight to higher-quality, more relevant sources. Reports include a `Source Quality` section so the source judgments are inspectable.
+
+## Layer 8: Search Planning
+
+Before the normal action loop begins, the agent now asks the model for a targeted search plan:
+
+```python
+{
+    "queries": [
+        "site:nasa.gov Chandra black hole growth",
+        "site:chandra.harvard.edu Chandra black hole growth",
+        "Chandra black hole growth Astrophysical Journal"
+    ],
+    "preferred_source_types": ["primary", "academic", "government"],
+    "rationale": "..."
+}
+```
+
+Python runs the planned queries, merges the results, removes duplicate URLs, and stores the combined results as the first observation. The normal action loop then chooses which pages to read from this richer candidate set.
+
+## Layer 9: Answer Reflection
+
+After answer synthesis, the agent asks a verifier to check grounding and completeness:
+
+```python
+{
+    "grounded": true,
+    "complete": true,
+    "recommended_action": "accept | revise | search_more",
+    "issues": [
+        {
+            "claim": "...",
+            "problem": "..."
+        }
+    ],
+    "missing_angles": ["..."],
+    "follow_up_queries": ["..."],
+    "revision_advice": "..."
+}
+```
+
+The reflector can use model knowledge to notice likely missing angles, but it cannot add unsupported facts to the final answer. If it recommends `revise`, the agent performs one revision using the existing evidence and verifier feedback. If it recommends `search_more`, the recommendation is recorded in the report for now.
+
+## Layer 10: Persistent Traces
+
+The Markdown report is for reading. The JSON trace is for debugging, learning, and future memory.
+
+Each trace includes:
+
+- run metadata such as provider, model, timestamps, limits, and duration
+- every action and observation
+- search plan and search results
+- page text metadata
+- extracted evidence
+- source quality
+- final synthesis and reflection result
+
+The trace is saved even when the agent does not finish, so failed runs remain inspectable.

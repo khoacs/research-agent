@@ -451,3 +451,746 @@ If the page reader returns noisy text, the LLM has to spend context and attentio
 ```
 
 Later, I may want to compare this simple BeautifulSoup approach with more specialized extraction libraries such as `trafilatura`, `readability-lxml`, or Firecrawl. For now, the simple version is good enough because the goal is to understand the layer.
+
+## 2026-05-16 - Layer 3: Action Format
+
+### What This Layer Adds
+
+Now that the project can call models and run tools manually, I added the contract between the model and the Python code.
+
+The model is told which actions exist:
+
+```text
+search_web
+read_page
+finish
+```
+
+And it must return one next action as JSON:
+
+```json
+{
+  "thought": "brief reason for the action",
+  "action": "search_web",
+  "action_input": {
+    "query": "..."
+  }
+}
+```
+
+This is not the full agent loop yet. The model chooses an action, but Python does not automatically execute it in this layer.
+
+Lesson:
+
+```text
+Tool use starts as a protocol.
+Before the model can use tools, it needs a language for requesting them.
+```
+
+### Files Added
+
+I separated this layer into two files:
+
+- `prompts.py`: builds the model messages that describe the available tools and JSON format
+- `agent.py`: asks the model for one next action and validates the returned JSON
+
+This keeps `main.py` from becoming the whole application.
+
+### First Agent-Step Test
+
+I tested:
+
+```bash
+python3 main.py agent-step "What are the tradeoffs between RAG and long-context LLMs?" --provider ollama
+python3 main.py agent-step "What are the tradeoffs between RAG and long-context LLMs?" --provider openrouter
+```
+
+Both Gemma 4 local and MiniMax via OpenRouter returned valid JSON and chose:
+
+```text
+action: search_web
+```
+
+Lesson:
+
+```text
+The action format works across both local and cloud models.
+That means the next layer can focus on orchestration instead of prompt basics.
+```
+
+### Python Environment Note
+
+During this step, I hit a Python environment mismatch. The shell used Apple's system Python 3.9.6, which did not have the installed dependencies, while the project had been using pyenv Python 3.14.4.
+
+I added:
+
+```text
+.python-version
+```
+
+with:
+
+```text
+3.14.4
+```
+
+Lesson:
+
+```text
+Even tiny AI projects need reproducible runtime setup.
+The model/tool architecture can be correct, but the wrong Python interpreter still breaks everything.
+```
+
+## 2026-05-16 - Layer 4: Orchestrator Loop
+
+### What This Layer Adds
+
+Layer 4 turns the pieces into an actual loop:
+
+```text
+ask model for next action
+parse action JSON
+run the selected Python tool
+store the observation
+show the observation to the model on the next step
+repeat
+```
+
+This is the first point where the project starts to feel like an agent instead of separate utilities.
+
+Lesson:
+
+```text
+The LLM is not the agent by itself.
+The loop around the LLM is what creates agentic behavior.
+```
+
+### State
+
+The orchestrator stores each step:
+
+```python
+{
+    "thought": "...",
+    "action": "search_web",
+    "action_input": {...},
+    "observation": {...}
+}
+```
+
+The next prompt includes the previous steps, so the model can choose what to do next based on what already happened.
+
+Lesson:
+
+```text
+An agent needs short-term state inside a run.
+Without state, every model call is isolated.
+```
+
+### First Local Run
+
+I tested:
+
+```bash
+python3 main.py run "What are the tradeoffs between RAG and long-context LLMs?" --provider ollama --max-steps 2
+```
+
+Gemma 4 successfully:
+
+1. chose `search_web`
+2. received DuckDuckGo results
+3. chose `read_page`
+4. read one of the returned URLs
+
+It did not finish in two steps, which was expected. Two steps only validated the mechanics.
+
+Lesson:
+
+```text
+A small max_steps setting is useful for debugging the loop.
+It proves the agent can move from search results to page reading before trying a full run.
+```
+
+### OpenRouter Free Model Limit
+
+I also tried a longer MiniMax OpenRouter run with `max_steps=4`.
+
+It failed with:
+
+```text
+HTTP 429
+minimax/minimax-m2.5:free is temporarily rate-limited upstream
+```
+
+Lesson:
+
+```text
+Agent loops multiply provider calls.
+A model that works for one step may hit free-tier limits during multi-step runs.
+```
+
+This makes the local Gemma 4 path even more useful for learning the loop without provider interruptions.
+
+### Next Improvement
+
+The current `run` command prints the final JSON only after the loop ends. For longer runs, this feels like a black box.
+
+A future improvement should stream progress:
+
+```text
+Step 1: search_web(...)
+Step 2: read_page(...)
+Step 3: ...
+```
+
+That would make the orchestrator easier to debug and easier to learn from.
+
+## 2026-05-16 - Progress Output And Tool Errors
+
+### Progress Output
+
+I added progress output to the orchestrator so a run now prints each step as it happens:
+
+```text
+Step 1: asking model for next action...
+Step 1: search_web
+Thought: ...
+Input: ...
+Observation: ...
+```
+
+Lesson:
+
+```text
+Agent loops should be observable.
+If the loop is a black box, debugging and learning both get harder.
+```
+
+### First Tool Error
+
+The progress output immediately revealed a realistic problem: the model chose a Medium URL from the search results, and `read_page` received:
+
+```text
+403 Forbidden
+```
+
+This is normal web reality. Some sites block scripted requests, require JavaScript, have bot protection, or behave differently from normal browser traffic.
+
+I changed the orchestrator so tool errors become observations instead of crashing the whole run:
+
+```python
+{
+    "error": "...",
+    "error_type": "HTTPError"
+}
+```
+
+Lesson:
+
+```text
+In an agent loop, tool failure is information.
+The model can use that observation to choose a different URL on the next step.
+```
+
+## 2026-05-16 - Finish Behavior And Markdown Report
+
+### Stopping Rule
+
+I made the prompt step-aware:
+
+```text
+Current step: N of max_steps
+Remaining steps after this action: M
+```
+
+The model is now told to ask at every step whether it has enough evidence to finish.
+
+Lesson:
+
+```text
+Stopping is a behavior that has to be designed.
+Otherwise the agent can keep searching or reading forever.
+```
+
+### Markdown Report
+
+I added a report writer that saves the final answer when the model chooses `finish`:
+
+```bash
+python3 main.py run "..." --output outputs/report.md
+```
+
+The report contains:
+
+```text
+Question
+Answer
+Sources
+```
+
+This turns the loop from a trace into a useful artifact.
+
+### First Report Quality Issue
+
+The first full run successfully produced a Markdown report, but it exposed a quality issue:
+
+- the model tried to read a Medium page
+- Medium returned `403 Forbidden`
+- the model then read one successful page
+- the model chose `finish`
+
+That means the model treated an attempted page read as part of its evidence, even though one read failed.
+
+I tightened the prompt:
+
+```text
+Read at least two successful, relevant pages before finishing.
+A failed read_page observation with an error does not count as evidence.
+```
+
+Lesson:
+
+```text
+The orchestrator can record errors, but the prompt must teach the model how to interpret them.
+```
+
+### JSON Mode
+
+During a rerun, Gemma 4 gathered enough evidence but returned malformed JSON when trying to finish with a long answer.
+
+I enabled Ollama JSON mode:
+
+```python
+"format": "json"
+```
+
+This fixed the malformed final answer and allowed the agent to save a Markdown report successfully.
+
+Lesson:
+
+```text
+Structured-output mode is valuable once answers get long.
+Prompting for JSON helps, but provider-level JSON mode is more reliable when available.
+```
+
+### Remaining Quality Issue
+
+The successful report used one full page read plus search result snippets. The model still described the evidence as if it had enough source coverage.
+
+Lesson:
+
+```text
+Prompt instructions help, but they are not the same as programmatic guarantees.
+If I truly require two successful page reads, the orchestrator should enforce that in code.
+```
+
+## 2026-05-16 - Hard Source Enforcement
+
+### Prompt Policy vs Code Policy
+
+I added a hard `min_sources` rule in the orchestrator:
+
+```bash
+--min-sources 2
+```
+
+The agent is not allowed to accept a `finish` action until it has enough successful `read_page` observations.
+
+Then I discovered that "successful" also needed a definition. A page could return a tiny amount of irrelevant text and still technically count as a read. I added:
+
+```bash
+--min-source-chars 500
+```
+
+Lesson:
+
+```text
+Soft policy: ask the model to read enough sources.
+Hard policy: count successful source reads in Python.
+```
+
+### Black Hole Test
+
+I tested a different topic:
+
+```bash
+python3 main.py run "What is a black hole and what are the latest important discoveries about black holes?" --provider ollama --max-steps 7 --min-sources 2 --min-source-chars 500 --output outputs/black_holes_strict.md
+```
+
+The first strict attempt revealed another model behavior problem: after reading enough black-hole sources, the model drifted into an unrelated Roman Empire search. I improved the prompt by adding:
+
+```text
+Successful source reads: N of M required.
+If the minimum source count is met, choose finish now.
+Stay on the original research question.
+```
+
+The final run behaved correctly:
+
+1. searched for black-hole information
+2. read a NASA article about a rapidly growing black hole
+3. read a Space.com black-hole coverage page
+4. finished and saved a Markdown report
+
+Lesson:
+
+```text
+Giving the model explicit state counters helps it obey the orchestrator's intent.
+Agents need both memory of what happened and clear signals about what that memory means.
+```
+
+## 2026-05-16 - Source Metadata
+
+### Making Observations Less Opaque
+
+After the black-hole run worked, I noticed that "two sources" is still a pretty weak idea. A page can be long but unfocused, or useful but truncated, or come from a domain I may want to treat differently later.
+
+I added simple metadata to `read_page`:
+
+```python
+{
+    "domain": "...",
+    "char_count": 6000,
+    "source_char_count": 18420,
+    "was_truncated": True,
+}
+```
+
+The agent now uses `char_count` when deciding whether a page counts as a substantial source.
+
+Lesson:
+
+```text
+Agent observations should be structured records, not just text dumps.
+The more measured facts a tool returns, the less the model has to infer from messy context.
+```
+
+This is also a step toward source quality. Later, the agent can use the same kind of metadata for things like source type, dates, relevance scores, and extracted evidence notes.
+
+## 2026-05-16 - Evidence Extraction
+
+### Turning Pages Into Claims
+
+The next improvement was to stop treating a page read as only a large block of text. After every successful `read_page`, the orchestrator now asks the model to extract compact evidence notes:
+
+```python
+{
+    "relevance": "high",
+    "summary": "what this page contributes",
+    "notes": [
+        {
+            "claim": "a factual point relevant to the question",
+            "supporting_text": "a short phrase from the page"
+        }
+    ]
+}
+```
+
+This is not exposed as a new tool action. The model still chooses between:
+
+```text
+search_web
+read_page
+finish
+```
+
+The evidence extraction happens inside Python after a page is read.
+
+Lesson:
+
+```text
+Not every model call has to be an agent action.
+Some model calls are background processing steps that make the agent state cleaner.
+```
+
+### Why This Matters
+
+Before this layer, the final answer depended on the model re-reading large page observations in the prompt. Now each page also carries a smaller evidence record that the final synthesis can use.
+
+Lesson:
+
+```text
+Good agent memory is not just a transcript.
+It is a progressively refined working state.
+```
+
+The Markdown report now includes an Evidence Notes section so I can inspect what the agent thought each source contributed.
+
+During the first test, the model mostly followed the evidence schema but let one supporting quote run long. I added a small Python guard that trims `supporting_text` to 20 words.
+
+Lesson:
+
+```text
+Formatting constraints belong in code when they matter.
+The prompt can request the shape, but Python should enforce the parts that are easy to check.
+```
+
+## 2026-05-16 - Separate Answer Synthesis
+
+### Finish Is Now A Control Signal
+
+Originally, the model chose `finish` and wrote the final answer in the same JSON action:
+
+```python
+{
+    "action": "finish",
+    "action_input": {
+        "answer": "..."
+    }
+}
+```
+
+That worked, but it mixed two jobs:
+
+```text
+decide whether research is done
+write the final answer
+```
+
+I changed `finish` into a control signal:
+
+```python
+{
+    "action": "finish",
+    "action_input": {
+        "reason": "the evidence is enough"
+    }
+}
+```
+
+When Python accepts that signal, it calls a separate synthesis prompt using the extracted evidence notes.
+
+Lesson:
+
+```text
+Agent workflows get easier to debug when decisions and final generation are separate steps.
+```
+
+### Synthesis From Evidence Notes
+
+The new synthesis step returns:
+
+```python
+{
+    "answer": "...",
+    "confidence": "high",
+    "limitations": "..."
+}
+```
+
+This means the final report is not just whatever the action-selection model decided to write in the moment. It is a dedicated generation step grounded in the cleaner evidence state.
+
+Lesson:
+
+```text
+A good agent state can become the input to specialized model calls.
+The orchestrator is not only a loop runner; it decides which model job happens when.
+```
+
+## 2026-05-16 - Source Quality Scoring
+
+### Not All Sources Should Count Equally
+
+The Chandra test made it obvious that two successful reads can still be very different. An official Chandra or NASA-related page should carry more weight than a secondary blog-style summary, even if both pages produce useful evidence notes.
+
+I added another background model call after evidence extraction:
+
+```python
+{
+    "source_type": "primary",
+    "credibility": "high",
+    "relevance": "high",
+    "weight": 5,
+    "reason": "..."
+}
+```
+
+This score is stored in the page observation as:
+
+```python
+observation["source_quality"]
+```
+
+Lesson:
+
+```text
+Retrieval is not only about finding information.
+An agent also needs to decide how much each source deserves to influence the answer.
+```
+
+### Source Quality Becomes Part Of Synthesis
+
+The final synthesis prompt now receives source quality next to the evidence notes. It is instructed to give more weight to higher-quality and more relevant sources.
+
+Lesson:
+
+```text
+Structured source judgment is a bridge between raw retrieval and trustworthy synthesis.
+Without it, every readable page looks equally important to the model context.
+```
+
+The report now includes a Source Quality section so I can inspect and disagree with the agent's source judgments.
+
+### First Test Exposed A Schema Slip
+
+The first source-quality smoke test failed before reaching the scoring step because the local model returned only:
+
+```json
+{
+  "thought": "..."
+}
+```
+
+It forgot the required `action` and `action_input` fields.
+
+I added a one-shot repair path: if action parsing fails, Python sends the invalid response and parser error back to the model and asks for corrected JSON.
+
+In this test, the local model repeated the same incomplete JSON even after the repair prompt. I added one deterministic fallback: if search results exist and the model forgot the action fields, Python reads the first unread search result.
+
+Lesson:
+
+```text
+Structured output is a protocol, but model responses can still drift.
+A practical orchestrator needs small repair loops around schema boundaries.
+When repair fails, deterministic fallbacks can keep simple workflows moving.
+```
+
+## 2026-05-16 - Search Planning
+
+### Better Retrieval Starts Before Search
+
+The agent was previously asking for one broad search query and then choosing from whatever DuckDuckGo returned. That worked, but it made retrieval too accidental.
+
+I added a search-planning step before the action loop:
+
+```python
+{
+    "queries": [
+        "site:nasa.gov Chandra black hole growth",
+        "site:chandra.harvard.edu Chandra black hole growth",
+        "Chandra black hole growth Astrophysical Journal"
+    ],
+    "preferred_source_types": ["primary", "academic", "government"],
+    "rationale": "..."
+}
+```
+
+Python runs the planned queries, merges the results, deduplicates URLs, and stores the combined results as the first observation.
+
+Lesson:
+
+```text
+Search quality is part of agent design.
+If retrieval starts with a weak query, every later layer has to compensate.
+```
+
+### Planning Is Not The Same As Acting
+
+The search plan is another background model call. It does not give the agent a new public action. The visible agent actions stay simple:
+
+```text
+search_web
+read_page
+finish
+```
+
+Lesson:
+
+```text
+Modern agent workflows often use hidden planning steps to improve tool calls.
+The user-facing action space can stay simple while the orchestrator gets smarter.
+```
+
+## 2026-05-16 - Answer Reflection
+
+### Grounding And Completeness Are Different Checks
+
+I added a reflection step after answer synthesis. It checks two things:
+
+```text
+Is the answer grounded in the evidence notes?
+Does the answer miss an important likely angle?
+```
+
+This matters because the model's own knowledge can be useful, but I do not want it to silently add unsupported facts to the final answer.
+
+The reflection output looks like:
+
+```python
+{
+    "grounded": True,
+    "complete": True,
+    "recommended_action": "accept",
+    "issues": [],
+    "missing_angles": [],
+    "follow_up_queries": [],
+    "revision_advice": ""
+}
+```
+
+Lesson:
+
+```text
+The model's latent knowledge is safest when it proposes checks and searches, not uncited final claims.
+```
+
+### Accept, Revise, Or Search More
+
+The reflector can recommend:
+
+```text
+accept
+revise
+search_more
+```
+
+For this layer, I wired in `accept` and one `revise` pass. If the reflector recommends `search_more`, the report records the missing angle and follow-up queries, but the agent does not yet expand the retrieval loop automatically.
+
+Lesson:
+
+```text
+Reflection is a control signal.
+The orchestrator decides which reflection recommendations are allowed to change the workflow.
+```
+
+## 2026-05-16 - Persistent Run Traces
+
+### Saving The Black Box Recorder
+
+The Markdown report is easy to read, but it does not preserve everything the agent did. I added a JSON trace file next to every Markdown report:
+
+```text
+outputs/example.md
+outputs/example.md.trace.json
+```
+
+The trace includes:
+
+```text
+metadata
+search plan
+all actions
+all observations
+evidence notes
+source quality scores
+reflection result
+final answer
+```
+
+Lesson:
+
+```text
+Agent development needs durable traces.
+Without saved traces, every debugging session depends on whatever was visible in the terminal.
+```
+
+### Failed Runs Are Also Data
+
+The CLI saves the trace even when the agent does not finish. This is intentional. A failed run can show where the loop got stuck, which source failed, or which model response broke the schema.
+
+Lesson:
+
+```text
+Failures are part of the learning artifact.
+For an agent project, failed traces are often more informative than successful reports.
+```
