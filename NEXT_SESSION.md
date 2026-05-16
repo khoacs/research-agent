@@ -68,6 +68,7 @@ Notes:
 - OpenRouter free models can be rate-limited.
 - Qwen free route via OpenRouter previously hit provider limits.
 - Google Gemini API was avoided because billing verification required a deposit/payment setup.
+- The user wants to try Rapid-MLX next as a possible faster Apple Silicon local runtime.
 
 ## Current Output Behavior
 
@@ -113,6 +114,46 @@ Expected behavior:
 - `.env` is ignored and contains the OpenRouter key locally. Do not commit it.
 
 ## Recommended Next Action
+
+Start with a Rapid-MLX local runtime experiment.
+
+Why:
+
+- The current Ollama/Gemma 4 path works, but full agent runs can take around 2-3 minutes.
+- The MacBook Air 16GB gets warm during local inference.
+- Rapid-MLX claims to be an Apple Silicon optimized, OpenAI-compatible local inference server.
+- This is a good learning branch because runtime choice matters, not only model choice.
+
+Suggested experiment:
+
+```text
+Ollama baseline
+-> install/run Rapid-MLX separately
+-> run the same tiny JSON prompt through both
+-> compare latency, schema reliability, and heat/feel
+-> if promising, add a rapid_mlx provider to llm.py
+```
+
+Keep Ollama as the stable baseline. Do not replace it immediately.
+
+Things to check:
+
+- Does Rapid-MLX support a model that fits MacBook Air 16GB comfortably?
+- Does it expose an OpenAI-compatible `/v1/chat/completions` endpoint?
+- Does it support JSON-structured output reliably enough for this agent?
+- Does it actually feel faster/cooler on this machine for short agent calls?
+- Does it require MLX-format models separate from Ollama model files?
+
+If Rapid-MLX works well, update:
+
+- `llm.py`: add `rapid_mlx` provider
+- `config.py`: add Rapid-MLX base URL/model env vars
+- `README.md`: document the provider
+- `LEARNING_LOG.md`: record install friction, performance, and comparison with Ollama
+
+After the Rapid-MLX experiment, continue with the automatic `search_more` reflection loop.
+
+## Next Agent Feature
 
 Implement the automatic `search_more` reflection loop.
 
