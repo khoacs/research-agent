@@ -254,6 +254,11 @@ def print_progress(event: str, payload: dict[str, Any]) -> None:
         print("Revising answer from reflection feedback...")
         return
 
+    if event == "reflection_search_more":
+        print("Reflection requested more evidence. Running follow-up searches...")
+        print(f"Follow-up queries: {'; '.join(payload['queries'])}")
+        return
+
 
 def _summarize_observation(observation: Any) -> str:
     if isinstance(observation, list):

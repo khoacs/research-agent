@@ -1194,3 +1194,404 @@ Lesson:
 Failures are part of the learning artifact.
 For an agent project, failed traces are often more informative than successful reports.
 ```
+
+## 2026-05-17 - Rapid-MLX Runtime Preflight
+
+### Why Runtime Choice Is A Real Layer
+
+The next recommended experiment was not another agent feature. It was a runtime comparison:
+
+```text
+Ollama baseline -> Rapid-MLX local server -> same JSON prompt -> compare behavior
+```
+
+This matters because the agent is now making many model calls per run:
+
+- search planning
+- next-action decisions
+- evidence extraction
+- source quality scoring
+- answer synthesis
+- reflection
+- optional revision
+
+So runtime latency and heat are no longer background details. They shape whether the loop feels usable.
+
+### Rapid-MLX Docs Check
+
+Rapid-MLX presents itself as an Apple Silicon local inference server with an OpenAI-compatible API. The documented local endpoint is:
+
+```text
+http://localhost:8000/v1/chat/completions
+```
+
+For a 16 GB MacBook Air, the docs recommend starting small with:
+
+```bash
+rapid-mlx serve qwen3.5-4b --port 8000
+```
+
+The app can then call the server with:
+
+```text
+base URL: http://localhost:8000/v1
+model: default
+```
+
+### What Was Verified Today
+
+Rapid-MLX was not installed locally at the start:
+
+```bash
+command -v rapid-mlx
+```
+
+returned no path.
+
+After installing with Homebrew:
+
+```bash
+brew install raullenchai/rapid-mlx/rapid-mlx
+```
+
+Rapid-MLX reported:
+
+```text
+rapid-mlx 0.6.51
+```
+
+The install pulled a substantial dependency stack and installed:
+
+```text
+/opt/homebrew/Cellar/rapid-mlx/0.6.51
+441.2 MB
+```
+
+`rapid-mlx doctor` failed inside the normal sandbox because it tried to create a diagnostic report under the Homebrew Cellar. Re-running it outside the sandbox passed:
+
+```text
+[metal] OK
+[imports] OK
+[cli] OK
+[model_load] SKIP (download required)
+Result: PASS
+```
+
+Ollama was installed and the baseline audition still worked:
+
+```bash
+/Users/khoand/.pyenv/versions/3.14.4/bin/python3 main.py audition --provider ollama
+```
+
+It returned valid action JSON:
+
+```json
+{
+  "action": "search_web",
+  "query": "tradeoffs between RAG and long-context LLMs"
+}
+```
+
+With wall-clock timing, the Ollama audition took about:
+
+```text
+10.94 seconds
+```
+
+### Rapid-MLX 4B Attempt
+
+I started:
+
+```bash
+rapid-mlx serve qwen3.5-4b --port 8000
+```
+
+The server downloaded the model and reached:
+
+```text
+Ready: http://localhost:8000/v1
+```
+
+But it also warned:
+
+```text
+Memory pressure warning
+Model on disk: 2.9 GB
+Estimated working set: 4.3 GB
+Currently used by OS: 9.9 GB
+Total system RAM: 16.0 GB
+Projected utilization: 88%
+```
+
+The tiny audition request then crashed the Rapid-MLX server with:
+
+```text
+[METAL] Command buffer execution failed: Insufficient Memory
+```
+
+Lesson:
+
+```text
+"Fits on 16 GB" is not the same as "comfortable on this 16 GB machine right now."
+The active OS memory state matters, and local runtime experiments need to watch failure modes beyond model quality.
+```
+
+### Smaller Rapid-MLX Follow-Up
+
+`rapid-mlx models` listed smaller aliases, including:
+
+```text
+gemma3-1b
+llama3-1b
+bonsai-1.7b
+smollm3-3b
+```
+
+I changed the project's Rapid-MLX default from `default` to:
+
+```text
+gemma3-1b
+```
+
+That first smaller attempt also taught something: `gemma3-1b` is listed as a small model, but Rapid-MLX tried to load it through its multimodal path and failed because the Homebrew install did not include the optional `mlx-vlm` dependency.
+
+It also reported that the OS was now using about 14.3 GB of 16 GB RAM after the previous failed experiment, which made even the 1B model startup look risky.
+
+I changed the project default again to the text-only alias:
+
+```text
+llama3-1b
+```
+
+That makes the next experiment a safer test of the OpenAI-compatible provider path without installing the vision extra.
+
+`llama3-1b` started successfully with lower GPU memory utilization:
+
+```bash
+rapid-mlx serve llama3-1b --port 8000 --gpu-memory-utilization 0.75
+```
+
+It still warned about memory pressure because the OS was already using about 14.3 GB of 16 GB, but it completed startup.
+
+### Rapid-MLX 1B Results
+
+The strict audition against Rapid-MLX took about:
+
+```text
+0.96 seconds
+```
+
+It returned the right JSON content, but wrapped it in a Markdown code fence:
+
+```text
+JSON check: failed
+```
+
+Then I tested the real action schema with:
+
+```bash
+/usr/bin/time -p /Users/khoand/.pyenv/versions/3.14.4/bin/python3 main.py agent-step "What are the tradeoffs between RAG and long-context LLMs?" --provider rapid_mlx
+```
+
+That took about:
+
+```text
+1.12 seconds
+```
+
+The model returned almost-correct action JSON, but omitted the final closing brace. This means `llama3-1b` is much faster than the Ollama/Gemma 4 baseline for the tiny prompt, but it is weaker at strict schema following.
+
+I improved the deterministic fallback so malformed near-JSON can still salvage simple quoted fields such as:
+
+```text
+thought
+query
+```
+
+The parsed fallback action became:
+
+```json
+{
+  "thought": "Tradeoffs between RAG and long-context LLMs Fallback: start with a web search.",
+  "action": "search_web",
+  "action_input": {
+    "query": "tradeoffs between RAG and long-context LLMs"
+  }
+}
+```
+
+Lesson:
+
+```text
+Fast local inference is not enough by itself.
+For an agent loop, schema reliability is part of model quality, and small models may need stronger repair and fallback paths.
+```
+
+### Code Change And Removal
+
+I temporarily added a third model provider:
+
+```text
+rapid_mlx
+```
+
+It uses the same OpenAI-compatible response shape as OpenRouter, but points at the local Rapid-MLX server and uses a dummy bearer token because local OpenAI-compatible servers usually only need the header shape, not a real API key.
+
+I also expanded connection error handling so a local server crash or closed socket is reported as a normal model-call failure instead of a raw Python traceback.
+
+The temporary configuration was:
+
+```text
+RAPID_MLX_BASE_URL=http://localhost:8000/v1
+RAPID_MLX_MODEL=llama3-1b
+```
+
+Lesson:
+
+```text
+An OpenAI-compatible local server is a useful provider boundary.
+If the server speaks the same chat-completions shape, the orchestrator does not need to know whether the model is cloud, Ollama, or MLX.
+```
+
+After discussing the results, I removed Rapid-MLX from the active repo surface:
+
+- removed the `rapid_mlx` provider from `llm.py`
+- removed Rapid-MLX environment variables from `config.py` and `.env.example`
+- removed Rapid-MLX setup and run commands from `README.md`
+- updated the handoff so the next action is back to the agent feature roadmap
+
+Final decision:
+
+```text
+Rapid-MLX has potential, but it is not useful for this repo right now.
+Keep the experiment in the learning log, but keep the app focused on Ollama and OpenRouter.
+```
+
+Lesson:
+
+```text
+Removing an experimental branch is progress when the experiment has answered its question.
+The repo should preserve lessons, not carry every path that seemed promising.
+```
+
+## 2026-05-17 - Automatic Search-More Reflection Loop
+
+### What Changed
+
+Before this layer, answer reflection could recommend:
+
+```text
+search_more
+```
+
+but Python only recorded that recommendation. The agent did not act on it.
+
+Now the orchestrator allows one bounded reflection-triggered retrieval round:
+
+```text
+synthesize answer
+-> reflect
+-> if search_more:
+   run follow-up searches from follow_up_queries
+   read up to two new sources
+   extract evidence notes
+   score source quality
+   synthesize again
+   reflect again
+```
+
+This keeps reflection as a control signal, but gives the orchestrator permission to act on it once.
+
+### Implementation Notes
+
+The new helper is:
+
+```python
+_run_reflection_search_more(...)
+```
+
+It appends normal trace steps:
+
+```text
+search_web
+read_page
+read_page
+```
+
+That means the expanded retrieval round shows up in the same `steps` list as the rest of the run. The Markdown report and JSON trace do not need a separate data format to explain what happened.
+
+The loop is intentionally bounded:
+
+- use at most three follow-up queries
+- read at most two new URLs
+- do at most one search-more retrieval round
+- reflect once more after resynthesis
+
+If the second reflection still recommends `search_more`, the recommendation remains recorded, but the agent does not recurse.
+
+### Verification
+
+I tested the branch with a monkeypatched in-process run that forced the first reflection to return `search_more`.
+
+The expected sequence happened:
+
+```text
+plan_search
+finish
+search_web
+read_page
+read_page
+```
+
+The synthesizer ran twice and the reflector ran twice:
+
+```text
+synthesize: 2
+reflect: 2
+```
+
+I also ran the normal Chandra smoke test:
+
+```bash
+/Users/khoand/.pyenv/versions/3.14.4/bin/python3 main.py run "What did NASA Chandra recently find about black hole growth?" --provider ollama --max-steps 4 --min-sources 1 --min-source-chars 500 --output outputs/chandra_search_more_smoke.md
+```
+
+That live run completed successfully in about 167 seconds and saved both:
+
+```text
+outputs/chandra_search_more_smoke.md
+outputs/chandra_search_more_smoke.md.trace.json
+```
+
+The live reflection recommended:
+
+```text
+accept
+```
+
+So the real smoke test confirmed the normal path still works, while the monkeypatched test confirmed the new `search_more` branch.
+
+### Permanent Test Harness
+
+I added the first unit test file:
+
+```text
+tests/test_agent_search_more.py
+```
+
+It uses `unittest` and `unittest.mock` to force the first reflection to return `search_more`. The test asserts that:
+
+- the follow-up search is appended to the trace
+- exactly two follow-up pages are read
+- synthesis runs twice
+- reflection runs twice
+- the final reflection result is used
+
+I also moved the `DDGS` import inside `search_web`, so importing `agent.py` for mocked unit tests does not load the DuckDuckGo dependency stack unless the real search tool is actually called.
+
+Lesson:
+
+```text
+Agent autonomy should be granted in small budgets.
+The reflector can ask for more evidence, but Python decides how much extra retrieval is allowed.
+```

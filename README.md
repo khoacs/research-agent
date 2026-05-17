@@ -172,6 +172,8 @@ add the observation to history
 ask again
 synthesize the final answer after finish is accepted
 reflect on grounding and completeness
+run one bounded follow-up retrieval round if reflection says search_more
+resynthesize and reflect again after follow-up retrieval
 revise once if reflection says the current evidence can fix the answer
 save Markdown report and JSON trace when --output is provided
 ```
@@ -282,7 +284,7 @@ After answer synthesis, the agent asks a verifier to check grounding and complet
 }
 ```
 
-The reflector can use model knowledge to notice likely missing angles, but it cannot add unsupported facts to the final answer. If it recommends `revise`, the agent performs one revision using the existing evidence and verifier feedback. If it recommends `search_more`, the recommendation is recorded in the report for now.
+The reflector can use model knowledge to notice likely missing angles, but it cannot add unsupported facts to the final answer. If it recommends `revise`, the agent performs one revision using the existing evidence and verifier feedback. If it recommends `search_more`, the agent runs one bounded follow-up retrieval round using the reflector's `follow_up_queries`, reads up to two new sources, extracts evidence, scores source quality, synthesizes again, and reflects again.
 
 ## Layer 10: Persistent Traces
 
@@ -299,3 +301,13 @@ Each trace includes:
 - final synthesis and reflection result
 
 The trace is saved even when the agent does not finish, so failed runs remain inspectable.
+
+## Tests
+
+Run the unit tests:
+
+```bash
+python3 -m unittest discover -s tests
+```
+
+The current test suite includes a mocked orchestrator test for the bounded reflection-triggered `search_more` retrieval loop.

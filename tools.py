@@ -5,7 +5,6 @@ from urllib.parse import urlparse
 
 import requests
 from bs4 import BeautifulSoup
-from ddgs import DDGS
 
 
 class SearchResult(TypedDict):
@@ -26,6 +25,8 @@ class PageContent(TypedDict):
 
 
 def search_web(query: str, max_results: int = 5) -> list[SearchResult]:
+    from ddgs import DDGS
+
     if not query.strip():
         raise ValueError("Search query cannot be empty.")
 

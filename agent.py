@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import json
+import re
 from collections.abc import Callable
 from datetime import UTC, datetime
 from typing import Any, Literal, TypedDict
@@ -94,6 +95,7 @@ class AgentResult(TypedDict):
 
 
 ProgressCallback = Callable[[str, dict[str, Any]], None]
+MAX_REFLECTION_SEARCH_READS = 2
 
 
 def choose_next_action(
@@ -274,10 +276,11 @@ def run_agent(
             min_sources,
             min_source_chars,
         ):
+            synthesis_steps = steps[:-1]
             _emit_progress(on_progress, "synthesizing_answer", {"step": step_number})
             synthesis = synthesize_answer(
                 question,
-                steps[:-1],
+                synthesis_steps,
                 provider=provider,
                 model=model,
             )
@@ -285,17 +288,51 @@ def run_agent(
             reflection = reflect_on_answer(
                 question,
                 synthesis,
-                steps[:-1],
+                synthesis_steps,
                 provider=provider,
                 model=model,
             )
+            if reflection["recommended_action"] == "search_more":
+                searched_more = _run_reflection_search_more(
+                    question,
+                    reflection,
+                    steps,
+                    provider=provider,
+                    model=model,
+                    on_progress=on_progress,
+                )
+                if searched_more:
+                    synthesis_steps = steps
+                    _emit_progress(
+                        on_progress,
+                        "synthesizing_answer",
+                        {"step": "reflection"},
+                    )
+                    synthesis = synthesize_answer(
+                        question,
+                        synthesis_steps,
+                        provider=provider,
+                        model=model,
+                    )
+                    _emit_progress(
+                        on_progress,
+                        "reflecting_answer",
+                        {"step": "reflection"},
+                    )
+                    reflection = reflect_on_answer(
+                        question,
+                        synthesis,
+                        synthesis_steps,
+                        provider=provider,
+                        model=model,
+                    )
             if reflection["recommended_action"] == "revise":
                 _emit_progress(on_progress, "revising_answer", {"step": step_number})
                 synthesis = revise_answer(
                     question,
                     synthesis,
                     reflection,
-                    steps[:-1],
+                    synthesis_steps,
                     provider=provider,
                     model=model,
                 )
@@ -339,6 +376,127 @@ def run_tool(action: AgentAction) -> Any:
         return {"reason": action["action_input"].get("reason", "")}
 
     raise ValueError(f"Unknown action: {action['action']}")
+
+
+def _run_reflection_search_more(
+    question: str,
+    reflection: AnswerReflection,
+    steps: list[AgentStep],
+    provider: Provider,
+    model: str | None,
+    on_progress: ProgressCallback | None,
+) -> bool:
+    queries = reflection["follow_up_queries"][:3]
+    if not queries:
+        return False
+
+    search_action: AgentAction = {
+        "thought": "Reflection found a missing angle; running bounded follow-up search.",
+        "action": "search_web",
+        "action_input": {"queries": queries},
+    }
+    _emit_progress(
+        on_progress,
+        "reflection_search_more",
+        {"queries": queries},
+    )
+    _emit_progress(
+        on_progress,
+        "action",
+        {"step": "reflection", "action": search_action},
+    )
+    try:
+        search_observation = run_tool(search_action)
+    except Exception as exc:
+        search_observation = {
+            "error": str(exc),
+            "error_type": exc.__class__.__name__,
+        }
+    _emit_progress(
+        on_progress,
+        "observation",
+        {
+            "step": "reflection",
+            "action": "search_web",
+            "observation": search_observation,
+        },
+    )
+    steps.append(
+        {
+            "thought": search_action["thought"],
+            "action": search_action["action"],
+            "action_input": search_action["action_input"],
+            "observation": search_observation,
+        }
+    )
+
+    if not isinstance(search_observation, list):
+        return True
+
+    for url in _unread_urls_from_results(
+        search_observation,
+        steps,
+        limit=MAX_REFLECTION_SEARCH_READS,
+    ):
+        read_action: AgentAction = {
+            "thought": "Reflection follow-up: read a new source for the missing angle.",
+            "action": "read_page",
+            "action_input": {"url": url},
+        }
+        _emit_progress(
+            on_progress,
+            "action",
+            {"step": "reflection", "action": read_action},
+        )
+        try:
+            read_observation = run_tool(read_action)
+            if _should_extract_evidence(read_action, read_observation):
+                _emit_progress(
+                    on_progress,
+                    "extracting_evidence",
+                    {"step": "reflection"},
+                )
+                read_observation["evidence"] = extract_evidence(
+                    question,
+                    read_observation,
+                    provider=provider,
+                    model=model,
+                )
+                _emit_progress(
+                    on_progress,
+                    "scoring_source",
+                    {"step": "reflection"},
+                )
+                read_observation["source_quality"] = score_source_quality(
+                    question,
+                    read_observation,
+                    provider=provider,
+                    model=model,
+                )
+        except Exception as exc:
+            read_observation = {
+                "error": str(exc),
+                "error_type": exc.__class__.__name__,
+            }
+        _emit_progress(
+            on_progress,
+            "observation",
+            {
+                "step": "reflection",
+                "action": "read_page",
+                "observation": read_observation,
+            },
+        )
+        steps.append(
+            {
+                "thought": read_action["thought"],
+                "action": read_action["action"],
+                "action_input": read_action["action_input"],
+                "observation": read_observation,
+            }
+        )
+
+    return True
 
 
 def plan_search(
@@ -750,8 +908,14 @@ def parse_agent_action(raw_response: str) -> AgentAction:
 
 
 def _fallback_action(raw_response: str, steps: list[AgentStep]) -> AgentAction:
-    data = _parse_json_object(raw_response)
+    try:
+        data = _parse_json_object(raw_response)
+    except ValueError:
+        data = {}
+
     thought = data.get("thought")
+    if not isinstance(thought, str) or not thought.strip():
+        thought = _extract_json_string_field(raw_response, "thought")
     if not isinstance(thought, str) or not thought.strip():
         thought = "Model returned incomplete action JSON; using deterministic fallback."
 
@@ -763,20 +927,43 @@ def _fallback_action(raw_response: str, steps: list[AgentStep]) -> AgentAction:
             "action_input": {"url": next_url},
         }
 
+    query = _extract_json_string_field(raw_response, "query") or thought.strip()
     return {
         "thought": f"{thought.strip()} Fallback: start with a web search.",
         "action": "search_web",
-        "action_input": {"query": thought.strip()},
+        "action_input": {"query": query},
     }
 
 
+def _extract_json_string_field(text: str, field: str) -> str | None:
+    pattern = rf'"{re.escape(field)}"\s*:\s*"((?:[^"\\]|\\.)*)"'
+    match = re.search(pattern, text)
+    if match is None:
+        return None
+
+    try:
+        value = json.loads(f'"{match.group(1)}"')
+    except json.JSONDecodeError:
+        return None
+
+    return value if isinstance(value, str) and value.strip() else None
+
+
 def _first_unread_search_url(steps: list[AgentStep]) -> str | None:
+    for url in _unread_urls_from_steps(steps, limit=1):
+        return url
+
+    return None
+
+
+def _unread_urls_from_steps(steps: list[AgentStep], limit: int) -> list[str]:
     read_urls = {
         step["action_input"].get("url")
         for step in steps
         if step["action"] == "read_page"
     }
 
+    urls: list[str] = []
     for step in steps:
         observation = step["observation"]
         if step["action"] not in {"plan_search", "search_web"} or not isinstance(
@@ -790,9 +977,37 @@ def _first_unread_search_url(steps: list[AgentStep]) -> str | None:
                 continue
             url = item.get("url")
             if isinstance(url, str) and url not in read_urls:
-                return url
+                read_urls.add(url)
+                urls.append(url)
+                if len(urls) >= limit:
+                    return urls
 
-    return None
+    return urls
+
+
+def _unread_urls_from_results(
+    results: list[Any],
+    steps: list[AgentStep],
+    limit: int,
+) -> list[str]:
+    read_urls = {
+        step["action_input"].get("url")
+        for step in steps
+        if step["action"] == "read_page"
+    }
+
+    urls: list[str] = []
+    for item in results:
+        if not isinstance(item, dict):
+            continue
+        url = item.get("url")
+        if isinstance(url, str) and url not in read_urls:
+            read_urls.add(url)
+            urls.append(url)
+            if len(urls) >= limit:
+                return urls
+
+    return urls
 
 
 def _parse_json_object(raw_response: str) -> dict[str, Any]:
