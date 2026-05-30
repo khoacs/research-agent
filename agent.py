@@ -7,12 +7,21 @@ from datetime import UTC, datetime
 from typing import Any, Literal, TypedDict
 
 from llm import Provider, call_llm
+from llm import embed_text
+from memory import (
+    build_search_memory_candidates,
+    build_search_memory_context_from_vector_matches,
+    load_memory_index,
+    load_vector_memory,
+    retrieve_vector_memory,
+)
 from prompts import (
     build_agent_step_messages,
     build_answer_reflection_messages,
     build_answer_revision_messages,
     build_answer_synthesis_messages,
     build_evidence_extraction_messages,
+    build_memory_selection_messages,
     build_search_plan_messages,
     build_source_quality_messages,
 )
@@ -150,6 +159,7 @@ def run_agent(
     max_steps: int = 5,
     min_sources: int = 2,
     min_source_chars: int = 500,
+    use_memory: bool = True,
     on_progress: ProgressCallback | None = None,
 ) -> AgentResult:
     steps: list[AgentStep] = []
@@ -162,9 +172,41 @@ def run_agent(
         "min_source_chars": min_source_chars,
         "started_at": started_at,
     }
+    memory_context = retrieve_search_memory_context(
+        question,
+        provider=provider,
+        model=model,
+        use_memory=use_memory,
+        on_progress=on_progress,
+    )
+    if memory_context["useful_domains"] or memory_context["failed_urls"]:
+        metadata["memory"] = {
+            "used_for_search_planning": True,
+            "selection": memory_context.get("_selection", "unknown"),
+            "useful_domain_count": len(memory_context["useful_domains"]),
+            "failed_url_count": len(memory_context["failed_urls"]),
+        }
+        _emit_progress(
+            on_progress,
+            "memory_context",
+            {"memory": metadata["memory"]},
+        )
+    else:
+        metadata["memory"] = {
+            "used_for_search_planning": False,
+            "selection": memory_context.get("_selection", "none"),
+            "useful_domain_count": 0,
+            "failed_url_count": 0,
+        }
+
     if max_steps > 1:
         _emit_progress(on_progress, "planning_search", {"step": 1})
-        search_plan = plan_search(question, provider=provider, model=model)
+        search_plan = plan_search(
+            question,
+            provider=provider,
+            model=model,
+            memory_context=memory_context,
+        )
         _emit_progress(on_progress, "search_plan", {"step": 1, "plan": search_plan})
         observation = search_web_many(
             search_plan["queries"],
@@ -503,10 +545,67 @@ def plan_search(
     question: str,
     provider: Provider = "ollama",
     model: str | None = None,
+    memory_context: dict[str, Any] | None = None,
 ) -> SearchPlan:
-    messages = build_search_plan_messages(question)
+    messages = build_search_plan_messages(question, memory_context=memory_context)
     raw_response = call_llm(messages, provider=provider, model=model)
     return parse_search_plan(raw_response, question)
+
+
+def select_search_memory_context(
+    question: str,
+    memory: dict[str, Any] | None,
+    provider: Provider = "ollama",
+    model: str | None = None,
+) -> dict[str, Any]:
+    candidates = build_search_memory_candidates(memory)
+    if not _has_memory_candidates(candidates):
+        return _empty_memory_context()
+
+    messages = build_memory_selection_messages(question, candidates)
+    try:
+        raw_response = call_llm(messages, provider=provider, model=model)
+        context = parse_search_memory_selection(raw_response, candidates)
+        context["_selection"] = "llm_selector"
+        return context
+    except (RuntimeError, ValueError):
+        return _empty_memory_context()
+
+
+def retrieve_search_memory_context(
+    question: str,
+    provider: Provider = "ollama",
+    model: str | None = None,
+    use_memory: bool = True,
+    on_progress: ProgressCallback | None = None,
+) -> dict[str, Any]:
+    if not use_memory:
+        return _empty_memory_context()
+
+    vector_memory = _load_vector_memory()
+    if vector_memory is not None:
+        _emit_progress(on_progress, "retrieving_vector_memory", {})
+        try:
+            matches = retrieve_vector_memory(
+                vector_memory,
+                embed_text(question),
+            )
+        except RuntimeError:
+            matches = []
+        context = build_search_memory_context_from_vector_matches(matches)
+        if context["useful_domains"] or context["failed_urls"]:
+            context["_selection"] = "vector"
+            return context
+
+    memory = _load_memory_index()
+    if memory is not None:
+        _emit_progress(on_progress, "selecting_memory", {})
+    return select_search_memory_context(
+        question,
+        memory,
+        provider=provider,
+        model=model,
+    )
 
 
 def extract_evidence(
@@ -635,6 +734,43 @@ def parse_search_plan(raw_response: str, question: str) -> SearchPlan:
         "queries": parsed_queries,
         "preferred_source_types": parsed_source_types,
         "rationale": rationale.strip(),
+    }
+
+
+def parse_search_memory_selection(
+    raw_response: str,
+    candidates: dict[str, Any],
+) -> dict[str, Any]:
+    data = _parse_json_object(raw_response)
+    selected_domains = _string_list(data.get("useful_domains"), limit=5)
+    selected_failed_urls = _string_list(data.get("failed_urls"), limit=5)
+
+    domain_records = {
+        domain.get("domain"): domain
+        for domain in candidates.get("domains", [])
+        if isinstance(domain, dict) and isinstance(domain.get("domain"), str)
+    }
+    failure_records = {
+        failure.get("url"): failure
+        for failure in candidates.get("failures", [])
+        if isinstance(failure, dict) and isinstance(failure.get("url"), str)
+    }
+
+    useful_domains = []
+    for domain in selected_domains:
+        record = domain_records.get(domain)
+        if record is not None:
+            useful_domains.append(record)
+
+    failed_urls = []
+    for url in selected_failed_urls:
+        record = failure_records.get(url)
+        if record is not None:
+            failed_urls.append(record)
+
+    return {
+        "useful_domains": useful_domains,
+        "failed_urls": failed_urls,
     }
 
 
@@ -813,6 +949,35 @@ def _finish_metadata(metadata: dict[str, Any]) -> dict[str, Any]:
         **metadata,
         "finished_at": finished_at,
         "duration_seconds": duration_seconds,
+    }
+
+
+def _load_memory_index() -> dict[str, Any] | None:
+    try:
+        return load_memory_index()
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _load_vector_memory() -> dict[str, Any] | None:
+    try:
+        return load_vector_memory()
+    except (OSError, ValueError, json.JSONDecodeError):
+        return None
+
+
+def _has_memory_candidates(candidates: dict[str, Any]) -> bool:
+    return any(
+        isinstance(candidates.get(key), list) and bool(candidates[key])
+        for key in ["domains", "sources", "failures"]
+    )
+
+
+def _empty_memory_context() -> dict[str, Any]:
+    return {
+        "useful_domains": [],
+        "failed_urls": [],
+        "_selection": "none",
     }
 
 

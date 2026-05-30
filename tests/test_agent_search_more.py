@@ -11,7 +11,12 @@ class SearchMoreReflectionLoopTest(unittest.TestCase):
         calls = {"synthesize": 0, "reflect": 0}
         events: list[str] = []
 
-        def fake_plan_search(question: str, provider: str = "ollama", model: str | None = None):
+        def fake_plan_search(
+            question: str,
+            provider: str = "ollama",
+            model: str | None = None,
+            memory_context: dict | None = None,
+        ):
             return {
                 "queries": ["initial query"],
                 "preferred_source_types": ["primary"],
@@ -150,6 +155,7 @@ class SearchMoreReflectionLoopTest(unittest.TestCase):
                 "test question",
                 max_steps=2,
                 min_sources=0,
+                use_memory=False,
                 on_progress=lambda event, payload: events.append(event),
             )
 

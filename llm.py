@@ -8,6 +8,7 @@ from typing import Literal, TypedDict
 
 from config import (
     OLLAMA_BASE_URL,
+    OLLAMA_EMBED_MODEL,
     OLLAMA_MODEL,
     OPENROUTER_API_KEY,
     OPENROUTER_MODEL,
@@ -64,6 +65,19 @@ def call_ollama(messages: list[Message], model: str | None = None) -> str:
 
     data = _post_json(f"{OLLAMA_BASE_URL}/api/chat", payload)
     return data["message"]["content"]
+
+
+def embed_text(text: str, model: str | None = None) -> list[float]:
+    payload = {
+        "model": model or OLLAMA_EMBED_MODEL,
+        "prompt": text,
+    }
+    data = _post_json(f"{OLLAMA_BASE_URL}/api/embeddings", payload)
+    embedding = data.get("embedding")
+    if not isinstance(embedding, list) or not embedding:
+        raise RuntimeError("Ollama embedding response did not include an embedding.")
+
+    return [float(value) for value in embedding]
 
 
 def _post_json(url: str, payload: dict, headers: dict[str, str] | None = None) -> dict:

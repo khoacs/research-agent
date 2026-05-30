@@ -5,7 +5,28 @@ import json
 from typing import Any
 
 from agent import choose_next_action, run_agent
-from llm import Provider, call_llm
+from config import OLLAMA_EMBED_MODEL
+from evals import (
+    DEFAULT_EVAL_JSON_PATH,
+    DEFAULT_EVAL_MARKDOWN_PATH,
+    build_eval_summary,
+    find_eval_trace_paths,
+    render_eval_markdown,
+    save_eval_markdown,
+    save_eval_summary,
+)
+from llm import Provider, call_llm, embed_text
+from memory import (
+    DEFAULT_MEMORY_PATH,
+    DEFAULT_TRACE_DIR,
+    DEFAULT_VECTOR_MEMORY_PATH,
+    build_vector_memory,
+    build_memory_index,
+    find_trace_paths,
+    render_memory_summary,
+    save_memory_index,
+    save_vector_memory,
+)
 from report import save_json_trace, save_markdown_report, trace_path_for_report
 from tools import read_page, search_web
 
@@ -120,6 +141,81 @@ def main() -> None:
         "--output",
         help="Optional path to save the final answer as a Markdown report.",
     )
+    run_parser.add_argument(
+        "--no-memory",
+        action="store_true",
+        help="Do not use memory indexes as retrieval guidance for search planning.",
+    )
+
+    memory_parser = subparsers.add_parser(
+        "memory",
+        help="Build an inspectable memory index from saved JSON traces.",
+    )
+    memory_parser.add_argument(
+        "--trace-dir",
+        default=str(DEFAULT_TRACE_DIR),
+        help="Directory containing *.trace.json files.",
+    )
+    memory_parser.add_argument(
+        "--output",
+        default=str(DEFAULT_MEMORY_PATH),
+        help="Path to save the generated memory index.",
+    )
+    memory_parser.add_argument(
+        "--no-save",
+        action="store_true",
+        help="Print a summary without writing memory/index.json.",
+    )
+    memory_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the full memory index as JSON.",
+    )
+    memory_parser.add_argument(
+        "--embed",
+        action="store_true",
+        help="Also build memory/vectors.json using the local Ollama embedding model.",
+    )
+    memory_parser.add_argument(
+        "--embedding-model",
+        default=OLLAMA_EMBED_MODEL,
+        help="Ollama embedding model to use with --embed.",
+    )
+    memory_parser.add_argument(
+        "--vector-output",
+        default=str(DEFAULT_VECTOR_MEMORY_PATH),
+        help="Path to save the generated vector memory JSON.",
+    )
+
+    eval_parser = subparsers.add_parser(
+        "eval",
+        help="Evaluate saved JSON traces and produce a summary.",
+    )
+    eval_parser.add_argument(
+        "--trace-dir",
+        default="outputs",
+        help="Directory containing *.trace.json files to evaluate.",
+    )
+    eval_parser.add_argument(
+        "--output",
+        default=str(DEFAULT_EVAL_JSON_PATH),
+        help="Path to save the eval summary JSON.",
+    )
+    eval_parser.add_argument(
+        "--markdown-output",
+        default=str(DEFAULT_EVAL_MARKDOWN_PATH),
+        help="Path to save the eval summary Markdown.",
+    )
+    eval_parser.add_argument(
+        "--no-save",
+        action="store_true",
+        help="Print the eval summary without writing files.",
+    )
+    eval_parser.add_argument(
+        "--json",
+        action="store_true",
+        help="Print the full eval summary as JSON instead of Markdown.",
+    )
 
     args = parser.parse_args()
 
@@ -160,6 +256,7 @@ def main() -> None:
                 max_steps=args.max_steps,
                 min_sources=args.min_sources,
                 min_source_chars=args.min_source_chars,
+                use_memory=not args.no_memory,
                 on_progress=print_progress,
             )
         except (RuntimeError, ValueError) as exc:
@@ -176,6 +273,55 @@ def main() -> None:
             print(f"Saved trace: {trace_path}")
 
         print(json.dumps(result, indent=2, ensure_ascii=False))
+        return
+
+    if args.command == "memory":
+        trace_paths = find_trace_paths(args.trace_dir)
+        memory = build_memory_index(trace_paths)
+        if not args.no_save:
+            path = save_memory_index(memory, args.output)
+            print(f"Saved memory index: {path}")
+
+        if args.embed:
+            try:
+                vector_memory = build_vector_memory(
+                    memory,
+                    embed_fn=lambda text: embed_text(text, model=args.embedding_model),
+                    embedding_model=args.embedding_model,
+                )
+            except RuntimeError as exc:
+                print(f"Could not build vector memory: {exc}")
+                print(
+                    "Make sure Ollama is running and the embedding model is available, "
+                    f"for example: ollama pull {args.embedding_model}"
+                )
+                return
+
+            vector_path = save_vector_memory(vector_memory, args.vector_output)
+            print(
+                f"Saved vector memory: {vector_path} "
+                f"({len(vector_memory.get('items', []))} items)"
+            )
+
+        if args.json:
+            print(json.dumps(memory, indent=2, ensure_ascii=False))
+        else:
+            print(render_memory_summary(memory))
+        return
+
+    if args.command == "eval":
+        trace_paths = find_eval_trace_paths(args.trace_dir)
+        summary = build_eval_summary(trace_paths)
+        if not args.no_save:
+            json_path = save_eval_summary(summary, args.output)
+            markdown_path = save_eval_markdown(summary, args.markdown_output)
+            print(f"Saved eval JSON: {json_path}")
+            print(f"Saved eval Markdown: {markdown_path}")
+
+        if args.json:
+            print(json.dumps(summary, indent=2, ensure_ascii=False))
+        else:
+            print(render_eval_markdown(summary))
         return
 
     if args.command is None:
@@ -221,6 +367,23 @@ def print_progress(event: str, payload: dict[str, Any]) -> None:
         queries = "; ".join(plan.get("queries", []))
         print(f"Search plan: {queries}")
         print(f"Preferred sources: {', '.join(plan.get('preferred_source_types', []))}")
+        return
+
+    if event == "selecting_memory":
+        print("Selecting relevant memory for search planning...")
+        return
+
+    if event == "retrieving_vector_memory":
+        print("Retrieving relevant memory with local embeddings...")
+        return
+
+    if event == "memory_context":
+        memory = payload["memory"]
+        print(
+            "Memory context: "
+            f"{memory['useful_domain_count']} useful domains, "
+            f"{memory['failed_url_count']} failed URLs available for search planning."
+        )
         return
 
     if event == "action":

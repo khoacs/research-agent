@@ -50,6 +50,12 @@ For Ollama, pull the local model:
 ollama pull gemma4:e4b
 ```
 
+For local vector memory, pull the embedding model:
+
+```bash
+ollama pull nomic-embed-text
+```
+
 Make sure Ollama is running:
 
 ```bash
@@ -163,6 +169,7 @@ outputs/rag_vs_long_context.md.trace.json
 The orchestrator repeats:
 
 ```text
+retrieve relevant long-term memory for search planning when available
 plan targeted searches before the action loop
 ask model for next action
 run the selected tool
@@ -302,6 +309,94 @@ Each trace includes:
 
 The trace is saved even when the agent does not finish, so failed runs remain inspectable.
 
+## Layer 11: Trace Memory
+
+Build an inspectable memory index from saved traces:
+
+```bash
+python3 main.py memory
+```
+
+By default, this reads:
+
+```text
+outputs/*.trace.json
+```
+
+and saves:
+
+```text
+memory/index.json
+```
+
+Build a simple JSON vector index too:
+
+```bash
+python3 main.py memory --embed
+```
+
+This uses Ollama's local embedding endpoint and saves:
+
+```text
+memory/vectors.json
+```
+
+The memory index summarizes:
+
+- past runs and whether they produced an answer
+- unique sources the agent successfully read
+- domain-level source history and average source weight
+- tool failures such as blocked `read_page` URLs
+- compact claims extracted from evidence notes
+
+The live agent now prefers `memory/vectors.json` when it exists. It embeds the new question, runs brute-force cosine similarity across the JSON vector items, and passes only the closest memory into the search-planning prompt. If no vector index exists, it falls back to the model-based semantic selector over `memory/index.json`.
+
+Memory is used only as retrieval guidance:
+
+- useful domains may inspire targeted `site:` searches
+- previously failed URLs can be avoided
+- old remembered claims are not treated as evidence for a new answer
+
+Final synthesis still uses evidence from the current run's page reads.
+
+To run without memory-guided search planning:
+
+```bash
+python3 main.py run "..." --no-memory
+```
+
+## Layer 12: Evaluation Harness
+
+Evaluate saved traces:
+
+```bash
+python3 main.py eval
+```
+
+By default, this reads:
+
+```text
+outputs/*.trace.json
+```
+
+and saves:
+
+```text
+outputs/evals/summary.json
+outputs/evals/summary.md
+```
+
+The eval summary records:
+
+- whether each run finished
+- source counts and source domains
+- average source quality weight
+- reflection result
+- whether memory was used
+- duration and a simple quality score
+
+This closes the learning loop: the project can now inspect whether agent runs are completing with grounded answers and useful sources, instead of only producing one-off reports.
+
 ## Tests
 
 Run the unit tests:
@@ -310,4 +405,4 @@ Run the unit tests:
 python3 -m unittest discover -s tests
 ```
 
-The current test suite includes a mocked orchestrator test for the bounded reflection-triggered `search_more` retrieval loop.
+The current test suite includes mocked tests for the bounded reflection-triggered `search_more` retrieval loop, the trace-memory index, vector-memory retrieval, memory-guided search planning, and eval summaries.

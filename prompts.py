@@ -6,7 +6,49 @@ from typing import Any
 from llm import Message
 
 
-def build_search_plan_messages(question: str) -> list[Message]:
+def build_memory_selection_messages(
+    question: str,
+    memory_candidates: dict[str, Any],
+) -> list[Message]:
+    return [
+        {
+            "role": "system",
+            "content": (
+                "You select relevant long-term memory for a research agent.\n"
+                "Return only valid JSON. Do not wrap the JSON in Markdown.\n\n"
+                "Memory is retrieval guidance only. It can help decide where to search, "
+                "but it is not evidence for the final answer.\n\n"
+                "Return exactly this shape:\n"
+                "{\n"
+                '  "useful_domains": ["..."],\n'
+                '  "failed_urls": ["..."],\n'
+                '  "rationale": "brief explanation"\n'
+                "}\n\n"
+                "Rules:\n"
+                "- Select only memory that is semantically relevant to the new research question.\n"
+                "- Prefer domains that previously produced high-quality sources for similar topics.\n"
+                "- Select failed URLs only if they are relevant enough that the planner might otherwise retry them.\n"
+                "- Return empty lists when the memory is unrelated.\n"
+                "- Do not select a domain only because it has a high weight; it must fit the question."
+            ),
+        },
+        {
+            "role": "user",
+            "content": (
+                f"Research question: {question}\n\n"
+                "Memory candidates:\n"
+                f"{json.dumps(memory_candidates, ensure_ascii=False)[:12000]}\n\n"
+                "Select the relevant memory slice."
+            ),
+        },
+    ]
+
+
+def build_search_plan_messages(
+    question: str,
+    memory_context: dict[str, Any] | None = None,
+) -> list[Message]:
+    memory_text = _format_search_memory_context(memory_context)
     return [
         {
             "role": "system",
@@ -23,13 +65,20 @@ def build_search_plan_messages(question: str) -> list[Message]:
                 "- Generate 2 or 3 search queries.\n"
                 "- Prefer targeted queries likely to find primary, academic, government, or official sources.\n"
                 "- Use site: filters when an obvious authoritative domain exists.\n"
+                "- If memory lists useful domains that fit the question, you may use site: filters for them.\n"
+                "- If memory lists failed URLs, do not target those exact URLs.\n"
+                "- Memory is only retrieval guidance. Do not treat old remembered claims as current evidence.\n"
                 "- Include one broader query if the topic may need recent news or context.\n"
                 "- Keep each query concise."
             ),
         },
         {
             "role": "user",
-            "content": f"Research question: {question}\n\nCreate a search plan.",
+            "content": (
+                f"Research question: {question}\n\n"
+                f"Memory context for retrieval only:\n{memory_text}\n\n"
+                "Create a search plan."
+            ),
         },
     ]
 
@@ -372,6 +421,51 @@ def _format_evidence_status(successful_source_count: int, min_sources: int) -> s
         f"Successful source reads: {successful_source_count} of {min_sources} required.\n"
         "Minimum source count is not met yet."
     )
+
+
+def _format_search_memory_context(memory_context: dict[str, Any] | None) -> str:
+    if not memory_context:
+        return "No memory context available."
+
+    lines: list[str] = []
+    useful_domains = memory_context.get("useful_domains")
+    if isinstance(useful_domains, list) and useful_domains:
+        lines.append("Useful domains from previous runs:")
+        for domain in useful_domains[:5]:
+            if not isinstance(domain, dict):
+                continue
+            name = domain.get("domain")
+            if not isinstance(name, str) or not name:
+                continue
+            source_types = domain.get("source_types")
+            source_type_text = ""
+            if isinstance(source_types, list) and source_types:
+                source_type_text = f", types={', '.join(str(item) for item in source_types[:3])}"
+            lines.append(
+                "- "
+                f"{name}: "
+                f"{domain.get('successful_reads', 0)} successful reads, "
+                f"{domain.get('failed_reads', 0)} failures, "
+                f"avg weight {domain.get('average_weight', 0)}"
+                f"{source_type_text}"
+            )
+
+    failed_urls = memory_context.get("failed_urls")
+    if isinstance(failed_urls, list) and failed_urls:
+        if lines:
+            lines.append("")
+        lines.append("Previously failed URLs to avoid when possible:")
+        for failure in failed_urls[:5]:
+            if not isinstance(failure, dict):
+                continue
+            url = failure.get("url")
+            if isinstance(url, str) and url:
+                lines.append(f"- {url} ({failure.get('error_type', 'error')})")
+
+    if not lines:
+        return "No useful retrieval memory available."
+
+    return "\n".join(lines)
 
 
 def _format_evidence_for_synthesis(steps: list[dict[str, Any]]) -> str:

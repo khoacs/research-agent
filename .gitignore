@@ -5,5 +5,5 @@ __pycache__/
 *.py[cod]
 
 outputs/
+memory/
 .DS_Store
-

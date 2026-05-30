@@ -1595,3 +1595,421 @@ Lesson:
 Agent autonomy should be granted in small budgets.
 The reflector can ask for more evidence, but Python decides how much extra retrieval is allowed.
 ```
+
+## 2026-05-17 - Layer 11: Trace Memory
+
+### Why Memory Starts With Traces
+
+The next recommended layer was memory and state management. I chose not to start by giving the live agent hidden long-term memory inside prompts.
+
+Instead, I made the existing trace files the first durable memory substrate:
+
+```text
+outputs/*.trace.json -> memory/index.json
+```
+
+This feels like the right learning step because the trace already contains the facts that matter:
+
+- what question was asked
+- which sources were read successfully
+- which URLs failed
+- what claims were extracted
+- how source quality was scored
+- whether the final answer was accepted
+
+Lesson:
+
+```text
+Agent memory should start as inspectable state, not invisible vibes in a prompt.
+```
+
+### Memory Tool
+
+I added a new command:
+
+```bash
+python3 main.py memory
+```
+
+It reads saved `.trace.json` files and writes:
+
+```text
+memory/index.json
+```
+
+The memory index records:
+
+```text
+runs
+sources
+domains
+failures
+```
+
+The useful parts are source and domain memory. The agent can now remember that a domain like `www.nasa.gov` produced high-quality evidence in earlier runs, while blocked pages can be remembered as failures.
+
+Lesson:
+
+```text
+Memory is not only conversation history.
+For a research agent, tool outcomes and source behavior are memory too.
+```
+
+### What Is Still Ephemeral
+
+The live action loop has not been changed yet. The current run still keeps short-term state in `steps`, and `memory/index.json` is only an inspectable artifact.
+
+This separation is intentional:
+
+```text
+short-term state: steps inside one run
+long-term state: distilled trace memory across runs
+```
+
+Lesson:
+
+```text
+Before memory influences behavior, it should be possible to read, test, and disagree with it.
+```
+
+### Next Memory Question
+
+The next step is to decide how memory should influence the agent:
+
+- search planning could see useful domains from prior traces
+- URL selection could avoid previously failed URLs
+- source quality scoring could compare a source with past domain behavior
+- user preferences could be stored separately from source/tool memory
+
+For now, the safest next experiment is read-only memory context for search planning. That would let the model learn from prior runs without letting memory directly override evidence or final synthesis.
+
+## 2026-05-17 - Memory-Guided Search Planning
+
+### Feeding Memory Back Conservatively
+
+After making the memory index inspectable, I connected it to the first safe place in the live loop:
+
+```text
+memory/index.json -> compact memory context -> search planning prompt
+```
+
+This means memory can now influence where the agent looks, but not what the final answer claims.
+
+The search planner can see:
+
+```text
+useful domains from previous runs
+previously failed URLs
+```
+
+For example, if previous traces show that `www.nasa.gov` and `www.cfa.harvard.edu` were high-quality sources, the planner may choose targeted searches using those domains. If a URL failed before, the planner is told not to target that exact URL when possible.
+
+Lesson:
+
+```text
+Long-term memory is safest when it first improves retrieval strategy, not final truth.
+```
+
+### The Evidence Boundary
+
+The prompt explicitly says:
+
+```text
+Memory is only retrieval guidance.
+Do not treat old remembered claims as current evidence.
+```
+
+This is important because old memory can be stale, incomplete, or wrong. The current answer still has to be synthesized from fresh page reads and evidence notes in the current run.
+
+Lesson:
+
+```text
+Memory can help the agent decide where to look.
+Evidence from the current run should decide what it says.
+```
+
+### What This Teaches About Production Systems
+
+This small layer makes a production pattern visible:
+
+```text
+past interactions -> distilled memory -> retrieved relevant memory -> prompt context
+```
+
+The hard part is not merely storing everything. The hard part is deciding:
+
+- what to remember
+- when to retrieve it
+- how much to place in the prompt
+- what authority the memory should have
+
+For this project, source and tool memory now have low authority. They can guide search planning, but they cannot bypass the research loop.
+
+I also added a `--no-memory` flag for `main.py run` so memory-guided planning can be turned off during clean experiments.
+
+Lesson:
+
+```text
+Memory should be inspectable and controllable.
+If it changes behavior, there should be a simple way to compare with memory disabled.
+```
+
+## 2026-05-17 - Semantic Memory Selection
+
+### Why Not Word Overlap
+
+A naive next step would have been keyword matching:
+
+```text
+new question words overlap old memory words -> include memory
+```
+
+That is easy to implement, but it is not very reliable. A question about "Chandra observations of early-universe quasars" can be related to earlier "black hole growth" memory even if the exact words differ. Conversely, two questions can share words and still need different sources.
+
+I added a model-based memory selector instead:
+
+```text
+memory/index.json
+-> compact memory candidates
+-> semantic selector model call
+-> selected memory context
+-> search planning prompt
+```
+
+The selector returns:
+
+```json
+{
+  "useful_domains": ["..."],
+  "failed_urls": ["..."],
+  "rationale": "..."
+}
+```
+
+Lesson:
+
+```text
+Memory retrieval is itself an intelligence problem.
+The system should select memory by meaning, not just surface words.
+```
+
+### Keeping The Selector Bounded
+
+The selector still does not see raw traces. Python first builds compact candidates from the index:
+
+```text
+domains
+sources
+failures
+```
+
+Each candidate contains only small fields such as domain, title, previous questions, claims, source type, and quality weight. If the selector returns invalid JSON or fails, the agent falls back to no memory rather than injecting unrelated context.
+
+Lesson:
+
+```text
+When memory selection fails, the safest fallback is less memory, not random memory.
+```
+
+## 2026-05-17 - JSON Vector Memory
+
+### Replacing Selector Cost With Embedding Retrieval
+
+The model-based semantic selector is smarter than keyword matching, but it adds another chat model call before every research run. I added a cheaper retrieval path:
+
+```text
+memory/index.json
+-> compact memory items
+-> local Ollama embeddings
+-> memory/vectors.json
+```
+
+At runtime:
+
+```text
+new question
+-> embedding vector
+-> brute-force cosine against memory/vectors.json
+-> top matches
+-> search-planning memory context
+```
+
+This means the agent can retrieve semantically related memory without asking a chat model to read all candidates every time.
+
+Lesson:
+
+```text
+Embeddings turn memory selection into vector math.
+The model cost moves from every run to index-building and one cheap query embedding.
+```
+
+### Why JSON First
+
+I intentionally used a JSON vector file instead of a vector database:
+
+```text
+memory/vectors.json
+```
+
+Each item stores:
+
+```text
+id
+kind
+text
+metadata
+embedding
+```
+
+The retrieval code loads the file, compares the question vector with every item vector, sorts by cosine similarity, and keeps the top matches.
+
+Lesson:
+
+```text
+Brute-force vector search is the clearest way to learn the idea.
+A vector database is an optimization and persistence layer, not a different concept.
+```
+
+### Fallback Order
+
+The runtime memory path is now:
+
+```text
+if memory/vectors.json exists:
+    use embedding retrieval
+else if memory/index.json exists:
+    use model-based semantic selector
+else:
+    use no memory
+```
+
+The old selector remains useful as a fallback and comparison point.
+
+Lesson:
+
+```text
+Memory systems benefit from graceful degradation.
+If the vector index is missing, the agent can still use the simpler semantic selector.
+```
+
+### First Embed Attempt
+
+I tested:
+
+```bash
+python3 main.py memory --embed
+```
+
+The normal memory index saved successfully, but vector building could not reach Ollama:
+
+```text
+Could not reach http://localhost:11434/api/embeddings
+```
+
+I changed the CLI to report this as an expected setup issue instead of printing a traceback. To build vectors, Ollama must be running and the embedding model must be available:
+
+```bash
+ollama pull nomic-embed-text
+ollama serve
+```
+
+Lesson:
+
+```text
+Vector memory adds another model dependency.
+Even when embeddings are local and cheap, the runtime still needs clear setup and failure messages.
+```
+
+## 2026-05-31 - Layer 12: Evaluation Harness
+
+### Closing The Loop
+
+The final substantial layer is not another agent capability. It is an evaluation harness:
+
+```bash
+python3 main.py eval
+```
+
+This reads saved trace files:
+
+```text
+outputs/*.trace.json
+```
+
+and writes:
+
+```text
+outputs/evals/summary.json
+outputs/evals/summary.md
+```
+
+The eval summary records:
+
+- whether each run finished
+- source count and domains
+- average source quality weight
+- reflection result
+- whether memory was used
+- duration
+- a simple quality score
+
+Lesson:
+
+```text
+An agent project should end with inspection, not just more features.
+Evaluation turns traces into feedback about whether the system is improving.
+```
+
+### First Eval Result
+
+The first eval pass found three completed Chandra traces:
+
+```text
+Traces evaluated: 3
+Finished runs: 3
+Memory-guided runs: 1
+Average score: 9.8
+```
+
+All three used two high-quality sources from:
+
+```text
+www.cfa.harvard.edu
+www.nasa.gov
+```
+
+One caveat: the vector-memory smoke trace was generated before the metadata label was fixed, so it still says `selection: semantic` even though the console output confirmed vector retrieval. Future traces should distinguish:
+
+```text
+none
+llm_selector
+vector
+```
+
+Lesson:
+
+```text
+Trace metadata is part of the product.
+If it is inaccurate, evaluation becomes harder even when runtime behavior is correct.
+```
+
+### Why This Is A Good Stopping Point
+
+The project now covers the full conceptual arc:
+
+```text
+model adapter
+tools
+action protocol
+orchestration
+evidence
+source quality
+synthesis
+reflection
+trace persistence
+memory
+vector retrieval
+evaluation
+```
+
+There are many possible improvements left, but the core learning objective is complete: the machinery of a modern research agent is now visible in plain Python, with saved traces and a small eval loop to inspect behavior.
