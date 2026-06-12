@@ -2,6 +2,8 @@
 
 Project 2 in the AI learning journey: a plain-Python research agent built layer by layer.
 
+A plain-Python research agent with web search, evidence extraction, source scoring, trace memory, and evals.
+
 This repo also keeps a personal learning record in [LEARNING_LOG.md](./LEARNING_LOG.md): decisions, failed attempts, provider surprises, and lessons learned along the way.
 
 ## Layer 1: Model Adapter
